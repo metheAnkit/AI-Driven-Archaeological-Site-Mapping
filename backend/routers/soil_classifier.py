@@ -1,248 +1,200 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from typing import List
 import os, io, base64
-from PIL import Image, ImageDraw, ImageFont
-import numpy as np
-import sys
+from PIL import Image
 
-# Try to import TensorFlow; fallback to mock if missing
-TF_AVAILABLE = False
-tf = None
-try:
-    import warnings
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore")
-        import tensorflow
-        tf = tensorflow
-        TF_AVAILABLE = True
-except Exception as e:
-    print(f"⚠️  TensorFlow import failed (non-critical): {e}")
-    TF_AVAILABLE = False
+TARGET_SIZE = (244, 244)
 
-CLASSIFIER_IMG_SIZE = (224, 224)
-SOIL_CLASSES = ["Alluvial Soil", "Black Soil", "Clay Soil", "Red Soil"]
-
-_model = None
-
-def get_model():
-    global _model
-    if _model is not None:
-        return _model
-    if not TF_AVAILABLE or tf is None:
-        return None
-    # Prefer .h5 by default, but allow extensionless and .keras
-    base_default = os.path.join(os.path.dirname(__file__), "..", "models", "weights", "soil_classifier.h5")
-    base_path = os.getenv("SOIL_CLASSIFIER_MODEL_PATH", base_default)
-    base_noext = base_path[:-3] if base_path.endswith('.h5') else base_path
-    candidates = [
-        os.path.abspath(base_path),
-        os.path.abspath(base_noext),
-        os.path.abspath(base_noext + ".keras"),
-    ]
-    model_path = next((p for p in candidates if os.path.exists(p)), None)
-    if model_path:
-        try:
-            _model = tf.keras.models.load_model(model_path)
-            return _model
-        except Exception as e:
-            print(f"⚠️  Failed to load soil classifier model: {e}")
-            return None
-    return None
-
-def _preprocess(pil: Image.Image) -> np.ndarray:
-    img = pil.resize(CLASSIFIER_IMG_SIZE, Image.Resampling.LANCZOS)
-    arr = np.array(img) / 255.0
-    return np.expand_dims(arr, axis=0)
-
-def _create_annotated_image(img: Image.Image, soil_type: str, confidence: float) -> str:
-    """Create annotated image with classification text overlay"""
-    # Keep original size but ensure it's reasonable for display
-    max_size = 800
-    w, h = img.size
-    if w > max_size or h > max_size:
-        ratio = min(max_size / w, max_size / h)
-        new_size = (int(w * ratio), int(h * ratio))
-        img_resized = img.resize(new_size, Image.Resampling.LANCZOS)
-    else:
-        img_resized = img.copy()
-    img_with_text = img_resized.copy()
-    draw = ImageDraw.Draw(img_with_text)
-    
-    # Color mapping for soil types
-    colors = {
-        "Alluvial Soil": "#4A90E2",  # Blue
-        "Black Soil": "#2C3E50",      # Dark gray/black
-        "Clay Soil": "#E67E22",       # Orange
-        "Red Soil": "#E74C3C"        # Red
-    }
-    text_color = colors.get(soil_type, "#FFFFFF")
-    
-    # Try to use a bold font, fallback to default
+def _load_model():
+    global _model_path_tried, _load_error
     try:
-        font_large = ImageFont.truetype("arial.ttf", 24)
-        font_small = ImageFont.truetype("arial.ttf", 16)
-    except:
+        from ultralytics import YOLO
+        import torch
+        
+        # Fix for PyTorch 2.6+ weights_only requirement
         try:
-            font_large = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 24)
-            font_small = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 16)
-        except:
+            import ultralytics.nn.tasks
+            torch.serialization.add_safe_globals([ultralytics.nn.tasks.DetectionModel])
+        except Exception:
+            pass
+        
+        model_path = os.getenv("SOIL_DETECTION_MODEL_PATH", os.path.join(os.path.dirname(__file__), "..", "models", "weights", "soil_detection_best.pt"))
+        model_path = os.path.abspath(model_path)
+        _model_path_tried = model_path
+        
+        if not os.path.exists(model_path):
+            print(f"⚠️ Soil detection model file not found at: {model_path}")
+            alt_paths = [
+                os.path.join(os.path.dirname(__file__), "..", "..", "models", "weights", "soil_detection_best.pt"),
+                "models/weights/soil_detection_best.pt",
+                "soil_detection_best.pt"
+            ]
+            for alt in alt_paths:
+                alt_abs = os.path.abspath(alt)
+                if os.path.exists(alt_abs):
+                    model_path = alt_abs
+                    _model_path_tried = model_path
+                    print(f"✅ Found soil model at: {model_path}")
+                    break
+            else:
+                _load_error = f"Soil model not found (tried: {model_path} and alternatives)"
+                print(f"❌ Soil model not found.")
+                return None
+        
+        print(f"✅ Loading soil detection model from: {model_path}")
+        
+        # Try loading with explicit weights_only=False handling
+        try:
+            from contextlib import contextmanager
+            
+            @contextmanager
+            def torch_load_patch():
+                original_load = torch.load
+                def patched_load(*args, **kwargs):
+                    kwargs['weights_only'] = False
+                    return original_load(*args, **kwargs)
+                torch.load = patched_load
+                try:
+                    yield
+                finally:
+                    torch.load = original_load
+            
+            with torch_load_patch():
+                model = YOLO(model_path)
+            
+            print(f"✅ Soil model loaded successfully!")
+            return model
+        except Exception as load_err:
+            print(f"⚠️ Failed with patched load, trying direct load...")
             try:
-                font_large = ImageFont.truetype("C:/Windows/Fonts/arial.ttf", 24)
-                font_small = ImageFont.truetype("C:/Windows/Fonts/arial.ttf", 16)
-            except:
-                font_large = ImageFont.load_default()
-                font_small = ImageFont.load_default()
-    
-    # Create temporary draw to measure text
-    temp_draw = ImageDraw.Draw(img_with_text)
-    
-    # Measure text sizes
-    text_main = soil_type
-    text_acc = f"Accuracy {int(confidence * 100)}%"
-    
-    try:
-        bbox = temp_draw.textbbox((0, 0), text_main, font=font_large)
-        text_width = bbox[2] - bbox[0]
-        text_height = bbox[3] - bbox[1]
-    except:
-        text_width = len(text_main) * 12
-        text_height = 24
-    
-    try:
-        bbox_acc = temp_draw.textbbox((0, 0), text_acc, font=font_small)
-        text_width_acc = bbox_acc[2] - bbox_acc[0]
-        text_height_acc = bbox_acc[3] - bbox_acc[1]
-    except:
-        text_width_acc = len(text_acc) * 8
-        text_height_acc = 16
-    
-    # Draw semi-transparent background for text
-    overlay = Image.new('RGBA', img_with_text.size, (0, 0, 0, 0))
-    overlay_draw = ImageDraw.Draw(overlay)
-    
-    padding = 10
-    overlay_draw.rectangle(
-        [(10, 10), (20 + text_width + padding, 20 + text_height + padding)],
-        fill=(0, 0, 0, 180)
-    )
-    
-    overlay_draw.rectangle(
-        [(10, 30 + text_height + padding), (20 + text_width_acc + padding, 50 + text_height + padding + text_height_acc)],
-        fill=(0, 0, 0, 180)
-    )
-    
-    img_with_text = Image.alpha_composite(img_with_text.convert('RGBA'), overlay)
-    draw = ImageDraw.Draw(img_with_text)
-    
-    # Draw text
-    draw.text((15, 15), text_main, fill=text_color, font=font_large)
-    draw.text((15, 35 + text_height + padding), text_acc, fill="#FFFFFF", font=font_small)
-    
-    # Convert to base64
-    buffered = io.BytesIO()
-    img_with_text.convert('RGB').save(buffered, format='PNG')
-    b64 = base64.b64encode(buffered.getvalue()).decode()
-    return f"data:image/png;base64,{b64}"
+                model = YOLO(model_path)
+                print(f"✅ Soil model loaded successfully (direct)!")
+                return model
+            except Exception:
+                _load_error = str(load_err)
+                raise load_err
+        
+    except Exception as e:
+        _load_error = str(e)
+        print(f"❌ Error loading soil model: {str(e)}")
+        return None
 
 router = APIRouter()
+_model = None
+_load_error = None
+_model_path_tried = None
 
-# Cache for deterministic results (filename -> result)
-_result_cache = {}
+def get_model():
+    global _model, _load_error, _model_path_tried
+    if _model is None:
+        try:
+            _model = _load_model()
+        except Exception as e:
+            _load_error = str(e)
+            _model = None
+    return _model
+
+@router.get('/status')
+async def model_status():
+    """Return status about soil detection model loading for diagnostics."""
+    loaded = _model is not None
+    return {
+        "model_loaded": loaded,
+        "model_path": _model_path_tried,
+        "load_error": _load_error
+    }
 
 @router.post("")
-async def run_soil_classifier(files: List[UploadFile] = File(...)):
+async def run_soil_detection(files: List[UploadFile] = File(...)):
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded")
 
     model = get_model()
-    results = []
-    print(f"🔍 Soil classifier model loaded: {model is not None}, TensorFlow available: {TF_AVAILABLE}")
+    results_payload = []
+    
+    print(f"🔍 Soil detection model loaded: {model is not None}")
+
     for f in files:
+        image_bytes = await f.read()
         try:
-            pil = Image.open(io.BytesIO(await f.read())).convert('RGB')
-        except Exception:
-            results.append({"filename": f.filename, "success": False, "error": "Invalid image"})
+            img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+            # Store original image
+            orig_buffered = io.BytesIO()
+            img.save(orig_buffered, format='PNG')
+            orig_b64 = base64.b64encode(orig_buffered.getvalue()).decode()
+        except Exception as e:
+            results_payload.append({"filename": f.filename, "success": False, "error": f"Invalid image: {str(e)}"})
             continue
 
-        # Store original image as base64
-        orig_buffered = io.BytesIO()
-        pil.save(orig_buffered, format='PNG')
-        orig_b64 = base64.b64encode(orig_buffered.getvalue()).decode()
-        
-        # Check cache first for deterministic results
-        cache_key = f.filename
-        if cache_key in _result_cache:
-            cached = _result_cache[cache_key]
-            results.append({
-                "filename": f.filename,
-                "success": True,
-                "soil_type": cached["soil_type"],
-                "confidence": cached["confidence"],
-                "original_image": f"data:image/png;base64,{orig_b64}",
-                "annotated_image": _create_annotated_image(pil, cached["soil_type"], cached["confidence"]),
-                "model": cached["model"]
-            })
-            continue
-        
+        original_size = img.size
+        img_resized = img.resize(TARGET_SIZE, Image.Resampling.LANCZOS)
+
         if model is None:
-            # Mock predictions - use deterministic hash based on filename for consistency
-            import hashlib
-            hash_val = int(hashlib.md5(f.filename.encode()).hexdigest(), 16)
-            idx = hash_val % len(SOIL_CLASSES)
-            # Use hash for consistent confidence (0.6-0.95 range)
-            conf = 0.6 + ((hash_val % 35) / 100.0)
-            soil_type = SOIL_CLASSES[idx]
-            
-            # Cache the result
-            _result_cache[cache_key] = {
-                "soil_type": soil_type,
-                "confidence": conf,
-                "model": "mock"
-            }
-            
-            # Create annotated image for mock too
-            annotated_img = _create_annotated_image(pil, soil_type, conf)
-            
-            results.append({
+            buffered = io.BytesIO()
+            img_resized.save(buffered, format='PNG')
+            b64 = base64.b64encode(buffered.getvalue()).decode()
+            results_payload.append({
                 "filename": f.filename,
                 "success": True,
-                "soil_type": soil_type,
-                "confidence": conf,
+                "segments": [],
+                "segment_count": 0,
+                "original_size": original_size,
+                "processed_size": TARGET_SIZE,
                 "original_image": f"data:image/png;base64,{orig_b64}",
-                "annotated_image": annotated_img,
-                "model": "mock"
+                "annotated_image": f"data:image/png;base64,{b64}",
+                "note": "Model not available, returned resized image"
             })
             continue
 
         try:
-            arr = _preprocess(pil)
-            pred = model.predict(arr, verbose=0)[0]
-            idx = int(np.argmax(pred))
-            conf = float(pred[idx])
-            soil_type = SOIL_CLASSES[idx]
+            pred = model.predict(img_resized, conf=0.25, imgsz=640, save=False, verbose=False)
+            r0 = pred[0]
             
-            # Cache the result for consistency
-            _result_cache[cache_key] = {
-                "soil_type": soil_type,
-                "confidence": conf,
-                "model": "keras"
-            }
+            # Get soil type from class prediction
+            # Order from data.yaml: ['Alluvial Soil', 'Black Soil', 'Clay Soil', 'Red Soil']
+            soil_classes = ["Alluvial Soil", "Black Soil", "Clay Soil", "Red Soil"]
+            soil_type = "Unknown"
+            confidence = 0.0
             
-            # Create annotated image with text overlay
-            annotated_img = _create_annotated_image(pil, soil_type, conf)
+            if hasattr(r0, 'boxes') and len(r0.boxes) > 0:
+                class_idx = int(r0.boxes.cls[0])
+                confidence = float(r0.boxes.conf[0])
+                if 0 <= class_idx < len(soil_classes):
+                    soil_type = soil_classes[class_idx]
             
-            results.append({
+            segments = []
+            if getattr(r0, 'masks', None) is not None and getattr(r0, 'boxes', None) is not None:
+                for i, _ in enumerate(r0.masks):
+                    segments.append({
+                        "class": int(r0.boxes.cls[i]),
+                        "class_name": soil_classes[int(r0.boxes.cls[i])] if int(r0.boxes.cls[i]) < len(soil_classes) else "Unknown",
+                        "confidence": float(r0.boxes.conf[i]),
+                    })
+            
+            # Get annotated image with overlays
+            annotated = r0.plot()
+            annotated_pil = Image.fromarray(annotated).resize(original_size, Image.Resampling.LANCZOS)
+            buffered = io.BytesIO()
+            annotated_pil.save(buffered, format='PNG')
+            b64 = base64.b64encode(buffered.getvalue()).decode()
+            
+            results_payload.append({
                 "filename": f.filename,
                 "success": True,
                 "soil_type": soil_type,
-                "confidence": conf,
+                "confidence": confidence,
+                "segments": segments,
+                "segment_count": len(segments),
+                "original_size": original_size,
+                "processed_size": TARGET_SIZE,
                 "original_image": f"data:image/png;base64,{orig_b64}",
-                "annotated_image": annotated_img,
-                "model": "keras"
+                "annotated_image": f"data:image/png;base64,{b64}",
             })
         except Exception as e:
-            # Even on error, return original image
-            results.append({
+            import traceback
+            traceback.print_exc()
+            print(f"❌ Soil detection error for {f.filename}: {str(e)}")
+            results_payload.append({
                 "filename": f.filename,
                 "success": False,
                 "error": str(e),
@@ -250,6 +202,6 @@ async def run_soil_classifier(files: List[UploadFile] = File(...)):
                 "annotated_image": f"data:image/png;base64,{orig_b64}"
             })
 
-    return {"total_files": len(files), "processed": len([r for r in results if r.get('success')]), "results": results}
+    return {"total_files": len(files), "processed": len([r for r in results_payload if r.get("success")]), "results": results_payload}
 
 

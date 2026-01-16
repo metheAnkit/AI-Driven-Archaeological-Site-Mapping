@@ -1,12 +1,21 @@
+# ArchaiMap Backend API
+import os
+import sys
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routers.VegetationSegmentationYolov8 import router as vegetation_router
-from routers.SoilDetectionYolov11 import router as soil_detection_router
-from routers.soil_classifier import router as soil_classifier_router
 import uvicorn
 
+# Import routers
+from routers.VegetationSegmentationYolov8 import router as veg_router
+from routers.soil_classifier import router as soil_router
+
+# Create app instance
 app = FastAPI(title="ArchaiMap API", version="1.0.0")
 
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,23 +24,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Main API endpoints
-app.include_router(vegetation_router, prefix="/api/vegetation", tags=["Vegetation"])
-app.include_router(soil_detection_router, prefix="/api/soil-detection", tags=["Soil Detection"])
-app.include_router(soil_classifier_router, prefix="/api/soil-classify", tags=["Soil Classifier"])
-
-# Render-style predict aliases
-app.include_router(vegetation_router, prefix="/predict/vegetation", tags=["Vegetation Predict"])
-app.include_router(soil_detection_router, prefix="/predict/soil", tags=["Soil Predict"])
-
+# Define basic routes
 @app.get("/")
 def root():
-    return {"name": "ArchaiMap API", "status": "ok"}
+    return {"name": "ArchaiMap API", "status": "ok", "version": "1.0.0"}
 
 @app.get("/health")
 def health():
     return {"status": "healthy"}
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+# Include routers
+app.include_router(veg_router, prefix="/api/vegetation", tags=["vegetation"])
+app.include_router(soil_router, prefix="/api/soil-classify", tags=["soil"])
 
+# Start server
+if __name__ == "__main__":
+    print("Starting FastAPI backend on http://0.0.0.0:8000", flush=True)
+    sys.stdout.flush()
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        log_level="info"
+    )
